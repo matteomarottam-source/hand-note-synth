@@ -1,3 +1,4 @@
+import argparse
 import time
 
 import cv2
@@ -74,8 +75,25 @@ def note_from_gesture(extended):
     return GESTURE_TO_NOTE.get(frozenset(extended))
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hand gesture note synth")
+    parser.add_argument(
+        "--camera",
+        default="0",
+        help="Camera index (e.g. 0, 1) or stream URL (e.g. for an IP-camera app). Default: 0",
+    )
+    return parser.parse_args()
+
+
 def main():
-    cap = cv2.VideoCapture(0)
+    args = parse_args()
+    source = int(args.camera) if args.camera.isdigit() else args.camera
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"Impossibile aprire la camera '{source}'. Prova un altro indice con --camera.")
+        return
+
     last_note = None
 
     with mp_hands.Hands(
