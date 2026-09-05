@@ -3,7 +3,7 @@ import os
 import threading
 import time
 import urllib.request
-from collections import Counter, deque
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -19,76 +19,58 @@ MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 
-NOTE_FREQS = {
-    "C": 261.63,
-    "D": 293.66,
-    "E": 329.63,
-    "F": 349.23,
-    "G": 392.00,
-    "A": 440.00,
-    "B": 493.88,
-}
-
-GESTURE_TO_NOTE = {
-    frozenset(["thumb"]): "C",
-    frozenset(["index"]): "D",
-    frozenset(["middle"]): "E",
-    frozenset(["ring"]): "F",
-    frozenset(["pinky"]): "G",
-    frozenset(["thumb", "index"]): "A",
-    frozenset(["thumb", "middle"]): "B",
-}
-
-GESTURE_LABELS = {
-    frozenset(["thumb"]): "Pollice",
-    frozenset(["index"]): "Indice",
-    frozenset(["middle"]): "Medio",
-    frozenset(["ring"]): "Anulare",
-    frozenset(["pinky"]): "Mignolo",
-    frozenset(["thumb", "index"]): "Pollice + Indice",
-    frozenset(["thumb", "middle"]): "Pollice + Medio",
-}
-
-SAMPLE_RATE = 44100
-TONE_DURATION = 1.6
-
-# relative amplitude of each harmonic; the rapid roll-off plus the percussive
-# envelope in play_note is what makes an additive tone read as "piano" rather
-# than as a plain synth beep
-PIANO_HARMONICS = [
-    (1, 1.00),
-    (2, 0.55),
-    (3, 0.32),
-    (4, 0.18),
-    (5, 0.10),
-    (6, 0.06),
-    (7, 0.03),
-    (8, 0.02),
+# (international name, italian name, frequency in Hz)
+NOTES = [
+    ("C", "Do", 261.63),
+    ("D", "Re", 293.66),
+    ("E", "Mi", 329.63),
+    ("F", "Fa", 349.23),
+    ("G", "Sol", 392.00),
+    ("A", "La", 440.00),
+    ("B", "Si", 493.88),
 ]
 
-TIPS_PIPS = {
-    "index": (8, 6),
-    "middle": (12, 10),
-    "ring": (16, 14),
-    "pinky": (20, 18),
-}
+SAMPLE_RATE = 44100
+NOTE_DURATION = 1.6
 
-MAX_WIDTH = 640
+# relative amplitude of each harmonic; the fast roll-off plus the percussive
+# envelope in build_note_waves is what makes an additive tone read as "piano"
+PIANO_HARMONICS = [(1, 1.00), (2, 0.55), (3, 0.32), (4, 0.18), (5, 0.10), (6, 0.06), (7, 0.03)]
 
-# a gesture must dominate this many of the last frames before it triggers a
-# note, which rejects the single-frame misreads that a laggy camera produces
-HISTORY_LEN = 7
-STABILITY_THRESHOLD = 4
+# the hand is detected on a small copy of the frame while the HUD is drawn at
+# display size: landmarks are normalized, so the smaller image costs less CPU
+# without moving anything on screen
+DISPLAY_WIDTH = 800
+DETECT_WIDTH = 384
 
-TEXT_COLOR = (250, 240, 230)
-ACCENT_COLOR = (255, 178, 74)
-LANDMARK_COLOR = (232, 150, 60)
-PANEL_COLOR = (18, 18, 24)
+# pinch distance relative to hand size, with hysteresis so a hand held near the
+# threshold does not retrigger the note over and over
+PINCH_ON = 0.35
+PINCH_OFF = 0.50
+
+CURSOR_SMOOTHING = 0.45
+FLASH_SECONDS = 0.28
+
+COLOR_PANEL = (24, 20, 17)
+COLOR_KEY = (46, 40, 35)
+COLOR_TEXT = (244, 240, 236)
+COLOR_MUTED = (168, 160, 152)
+COLOR_ACCENT = (66, 170, 255)
+COLOR_CURSOR = (255, 206, 120)
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (9, 10), (10, 11), (11, 12),
+    (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    (5, 9), (9, 13), (13, 17),
+]
 
 FONT_CANDIDATES = [
-    "C:/Windows/Fonts/segoeui.ttf",
-    "C:/Windows/Fonts/calibri.ttf",
-    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/calibrib.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
 ]
 
 
@@ -99,60 +81,88 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-FONT_NOTE = load_font(38)
-FONT_LEGEND = load_font(17)
+FONTS = {
+    "hero": load_font(52),
+    "label": load_font(24),
+    "small": load_font(15),
+}
+
+_sprite_cache = {}
 
 
-def play_note(freq):
-    n_samples = int(SAMPLE_RATE * TONE_DURATION)
-    t = np.linspace(0, TONE_DURATION, n_samples, endpoint=False)
+def text_sprite(text, font_key, color):
+    """Renders text once through PIL and caches it as a BGR + alpha pair.
 
-    wave = np.zeros(n_samples)
-    for harmonic, amplitude in PIANO_HARMONICS:
-        wave += amplitude * np.sin(2 * np.pi * freq * harmonic * t)
+    Converting the whole frame to PIL and back every frame was the most
+    expensive part of the old HUD; small cached sprites blit with plain numpy
+    instead, which keeps the text crisp without the per-frame conversion.
+    """
+    key = (text, font_key, color)
+    sprite = _sprite_cache.get(key)
+    if sprite is not None:
+        return sprite
 
+    font = FONTS[font_key]
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    left, top, right, bottom = measure.textbbox((0, 0), text, font=font)
+
+    image = Image.new("RGBA", (right - left + 4, bottom - top + 4), (0, 0, 0, 0))
+    ImageDraw.Draw(image).text((2 - left, 2 - top), text, font=font, fill=color[::-1] + (255,))
+
+    rgba = np.array(image)
+    bgr = rgba[:, :, 2::-1].astype(np.float32)
+    alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
+
+    sprite = (bgr, alpha)
+    _sprite_cache[key] = sprite
+    return sprite
+
+
+def blit(frame, sprite, x, y, center=False):
+    bgr, alpha = sprite
+    h, w = alpha.shape[:2]
+    if center:
+        x -= w // 2
+        y -= h // 2
+
+    x1, y1 = max(x, 0), max(y, 0)
+    x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    src_bgr = bgr[y1 - y:y2 - y, x1 - x:x2 - x]
+    src_alpha = alpha[y1 - y:y2 - y, x1 - x:x2 - x]
+    roi = frame[y1:y2, x1:x2]
+    roi[:] = (roi * (1 - src_alpha) + src_bgr * src_alpha).astype(np.uint8)
+
+
+def fill_panel(frame, x1, y1, x2, y2, color, opacity):
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    roi = frame[y1:y2, x1:x2]
+    cv2.addWeighted(np.full_like(roi, color), opacity, roi, 1 - opacity, 0, dst=roi)
+
+
+def build_note_waves():
+    """Synthesizes every note once at startup instead of on each trigger."""
+    t = np.linspace(0, NOTE_DURATION, int(SAMPLE_RATE * NOTE_DURATION), endpoint=False)
     envelope = np.exp(-3.0 * t)
-    attack_samples = int(SAMPLE_RATE * 0.006)
-    envelope[:attack_samples] *= np.linspace(0, 1, attack_samples)
-    wave *= envelope
+    attack = int(SAMPLE_RATE * 0.006)
+    envelope[:attack] *= np.linspace(0, 1, attack)
 
-    wave *= 0.35 / np.max(np.abs(wave))
-    sd.play(wave, SAMPLE_RATE)
+    waves = []
+    for _, _, freq in NOTES:
+        wave = np.zeros_like(t)
+        for harmonic, amplitude in PIANO_HARMONICS:
+            wave += amplitude * np.sin(2 * np.pi * freq * harmonic * t)
+        wave *= envelope
+        wave *= 0.35 / np.max(np.abs(wave))
+        waves.append(wave.astype(np.float32))
 
-
-def distance(landmarks, a, b):
-    return ((landmarks[a].x - landmarks[b].x) ** 2 + (landmarks[a].y - landmarks[b].y) ** 2) ** 0.5
-
-
-def extended_fingers(landmarks):
-    extended = []
-
-    # hand size is the reference for every threshold below, so detection does
-    # not change with how close the hand is to the camera
-    hand_size = distance(landmarks, 0, 9)
-    if hand_size == 0:
-        return extended
-
-    for name, (tip, pip) in TIPS_PIPS.items():
-        if (landmarks[pip].y - landmarks[tip].y) / hand_size > 0.15:
-            extended.append(name)
-
-    # thumb: orientation-independent check based on spread from pinky base,
-    # avoids depending on mediapipe's left/right handedness label
-    thumb_spread = (distance(landmarks, 4, 17) - distance(landmarks, 2, 17)) / hand_size
-    if thumb_spread > 0.20:
-        extended.append("thumb")
-
-    return extended
-
-
-def note_from_gesture(extended):
-    return GESTURE_TO_NOTE.get(frozenset(extended))
-
-
-def stable_note(history):
-    note, count = Counter(history).most_common(1)[0]
-    return note if count >= STABILITY_THRESHOLD else None
+    return waves
 
 
 def ensure_model():
@@ -161,50 +171,101 @@ def ensure_model():
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
 
-def draw_landmarks(frame, landmarks):
+def keyboard_layout(width, height):
+    margin = int(width * 0.05)
+    key_height = int(height * 0.17)
+    top = height - key_height - int(height * 0.06)
+    key_width = (width - 2 * margin) / len(NOTES)
+
+    rects = []
+    for i in range(len(NOTES)):
+        x1 = int(margin + i * key_width) + 4
+        x2 = int(margin + (i + 1) * key_width) - 4
+        rects.append((x1, top, x2, top + key_height))
+
+    return rects, margin, key_width
+
+
+def key_at(cursor_x, width, margin, key_width):
+    index = int((cursor_x * width - margin) / key_width)
+    return max(0, min(index, len(NOTES) - 1))
+
+
+def draw_hand(frame, landmarks):
     h, w = frame.shape[:2]
-    for lm in landmarks:
-        cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 4, LANDMARK_COLOR[::-1], -1)
+    points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, points[a], points[b], COLOR_PANEL, 4, cv2.LINE_AA)
+        cv2.line(frame, points[a], points[b], COLOR_MUTED, 1, cv2.LINE_AA)
+
+    for point in points:
+        cv2.circle(frame, point, 3, COLOR_TEXT, -1, cv2.LINE_AA)
 
 
-def legend_lines():
-    return [f"{note}   {GESTURE_LABELS[combo]}" for combo, note in GESTURE_TO_NOTE.items()]
+def draw_cursor(frame, position, pinching, keyboard_top):
+    x, y = position
+    cv2.line(frame, (x, y), (x, keyboard_top), COLOR_CURSOR, 1, cv2.LINE_AA)
+
+    if pinching:
+        cv2.circle(frame, (x, y), 16, COLOR_ACCENT, -1, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), 24, COLOR_ACCENT, 2, cv2.LINE_AA)
+    else:
+        cv2.circle(frame, (x, y), 12, COLOR_CURSOR, 2, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), 3, COLOR_CURSOR, -1, cv2.LINE_AA)
 
 
-def draw_overlay(frame, note):
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(image, "RGBA")
+def draw_keyboard(frame, rects, active_key, flashing_key):
+    for i, (x1, y1, x2, y2) in enumerate(rects):
+        international, italian, _ = NOTES[i]
 
-    draw.rounded_rectangle((14, 14, 250, 78), radius=10, fill=PANEL_COLOR + (190,))
-    draw.text((30, 26), f"Nota  {note or '—'}", font=FONT_NOTE, fill=ACCENT_COLOR)
+        if i == flashing_key:
+            fill_panel(frame, x1, y1, x2, y2, COLOR_ACCENT, 0.85)
+            label_color, sub_color = COLOR_PANEL, COLOR_PANEL
+        elif i == active_key:
+            fill_panel(frame, x1, y1, x2, y2, COLOR_KEY, 0.85)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_ACCENT, 2, cv2.LINE_AA)
+            label_color, sub_color = COLOR_TEXT, COLOR_ACCENT
+        else:
+            fill_panel(frame, x1, y1, x2, y2, COLOR_PANEL, 0.72)
+            label_color, sub_color = COLOR_TEXT, COLOR_MUTED
 
-    lines = legend_lines()
-    panel_top = 92
-    panel_height = 20 + len(lines) * 24
-    draw.rounded_rectangle(
-        (14, panel_top, 250, panel_top + panel_height),
-        radius=10,
-        fill=PANEL_COLOR + (170,),
-    )
+        center_x = (x1 + x2) // 2
+        blit(frame, text_sprite(italian, "label", label_color), center_x, y1 + 30, center=True)
+        blit(frame, text_sprite(international, "small", sub_color), center_x, y2 - 22, center=True)
 
-    y = panel_top + 12
-    for line in lines:
-        is_active = note is not None and line.startswith(note)
-        draw.text((30, y), line, font=FONT_LEGEND, fill=ACCENT_COLOR if is_active else TEXT_COLOR)
-        y += 24
 
-    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+def draw_hud(frame, note_index, fps, hand_visible):
+    width = frame.shape[1]
+
+    fill_panel(frame, 24, 24, 300, 116, COLOR_PANEL, 0.78)
+    if note_index is None:
+        blit(frame, text_sprite("—", "hero", COLOR_MUTED), 44, 36)
+        blit(frame, text_sprite("nessuna nota", "small", COLOR_MUTED), 46, 96)
+    else:
+        international, italian, freq = NOTES[note_index]
+        blit(frame, text_sprite(italian, "hero", COLOR_ACCENT), 44, 36)
+        blit(frame, text_sprite(f"{international} · {freq:.0f} Hz", "small", COLOR_MUTED), 46, 96)
+
+    status = "mano rilevata" if hand_visible else "mostra la mano alla camera"
+    status_color = COLOR_TEXT if hand_visible else COLOR_ACCENT
+    blit(frame, text_sprite(status, "small", status_color), 24, 130)
+
+    fps_sprite = text_sprite(f"{fps:.0f} FPS", "small", COLOR_MUTED)
+    blit(frame, fps_sprite, width - 24 - fps_sprite[1].shape[1], 28)
+
+    hint = "Muovi la mano per scegliere la nota  ·  pizzica pollice e indice per suonare  ·  Q per uscire"
+    blit(frame, text_sprite(hint, "small", COLOR_MUTED), frame.shape[1] // 2, frame.shape[0] - 22, center=True)
 
 
 class CameraStream:
     """Reads frames in a background thread and always exposes the latest one.
 
     A plain cv2.VideoCapture().read() call processes frames in the order the
-    stream delivers them, so if processing (MediaPipe) is slower than the
-    incoming framerate - very common with a phone streamed over WiFi - the
-    displayed frame falls further and further behind real time. Grabbing
-    continuously in the background and dropping stale frames keeps the lag
-    from accumulating.
+    stream delivers them, so if processing is slower than the incoming
+    framerate - very common with a phone streamed over WiFi - the displayed
+    frame falls further and further behind real time. Grabbing continuously in
+    the background and dropping stale frames keeps the lag from accumulating.
     """
 
     def __init__(self, source):
@@ -246,7 +307,7 @@ class CameraStream:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Hand gesture note synth")
+    parser = argparse.ArgumentParser(description="Hand gesture piano")
     parser.add_argument(
         "--camera",
         default="0",
@@ -260,6 +321,7 @@ def main():
     source = int(args.camera) if args.camera.isdigit() else args.camera
 
     ensure_model()
+    waves = build_note_waves()
 
     cap = CameraStream(source)
     if not cap.isOpened():
@@ -276,46 +338,96 @@ def main():
         running_mode=vision.RunningMode.VIDEO,
     )
 
-    history = deque(maxlen=HISTORY_LEN)
-    playing_note = None
+    cursor = None
+    pinching = False
+    playing_key = None
+    flash_until = 0.0
+    frame_times = deque(maxlen=30)
     start_time = time.time()
     last_timestamp_ms = -1
+    layout_cache = None
 
     with vision.HandLandmarker.create_from_options(options) as landmarker:
         while cap.isOpened():
+            loop_start = time.time()
+
             ok, frame = cap.read()
             if not ok or frame is None:
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            if frame.shape[1] > MAX_WIDTH:
-                scale = MAX_WIDTH / frame.shape[1]
-                frame = cv2.resize(frame, None, fx=scale, fy=scale)
-
+            if frame.shape[1] != DISPLAY_WIDTH:
+                scale = DISPLAY_WIDTH / frame.shape[1]
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            height, width = frame.shape[:2]
+            if layout_cache is None or layout_cache[0] != (width, height):
+                layout_cache = ((width, height), *keyboard_layout(width, height))
+            _, key_rects, margin, key_width = layout_cache
+            keyboard_top = key_rects[0][1]
+
+            detect_scale = DETECT_WIDTH / width
+            small = cv2.resize(frame, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+            )
 
             timestamp_ms = max(int((time.time() - start_time) * 1000), last_timestamp_ms + 1)
             last_timestamp_ms = timestamp_ms
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            detected_note = None
-            if result.hand_landmarks:
+            active_key = None
+            hand_visible = bool(result.hand_landmarks)
+
+            if hand_visible:
                 landmarks = result.hand_landmarks[0]
-                draw_landmarks(frame, landmarks)
-                detected_note = note_from_gesture(extended_fingers(landmarks))
+                draw_hand(frame, landmarks)
 
-            history.append(detected_note)
-            current_note = stable_note(history)
+                thumb, index = landmarks[4], landmarks[8]
+                target = ((thumb.x + index.x) / 2, (thumb.y + index.y) / 2)
+                cursor = target if cursor is None else (
+                    cursor[0] + (target[0] - cursor[0]) * CURSOR_SMOOTHING,
+                    cursor[1] + (target[1] - cursor[1]) * CURSOR_SMOOTHING,
+                )
 
-            if current_note is not None and current_note != playing_note:
-                play_note(NOTE_FREQS[current_note])
-            playing_note = current_note
+                hand_size = ((landmarks[0].x - landmarks[9].x) ** 2 + (landmarks[0].y - landmarks[9].y) ** 2) ** 0.5
+                pinch = (((thumb.x - index.x) ** 2 + (thumb.y - index.y) ** 2) ** 0.5) / max(hand_size, 1e-6)
 
-            cv2.imshow("Hand Note Synth", draw_overlay(frame, current_note))
+                active_key = key_at(cursor[0], width, margin, key_width)
 
+                if not pinching and pinch < PINCH_ON:
+                    pinching = True
+                elif pinching and pinch > PINCH_OFF:
+                    pinching = False
+                    playing_key = None
+
+                # retriggering while pinched lets you slide across keys
+                if pinching and active_key != playing_key:
+                    sd.play(waves[active_key], SAMPLE_RATE)
+                    playing_key = active_key
+                    flash_until = loop_start + FLASH_SECONDS
+
+                draw_cursor(
+                    frame,
+                    (int(cursor[0] * width), int(cursor[1] * height)),
+                    pinching,
+                    keyboard_top,
+                )
+            else:
+                cursor = None
+                pinching = False
+                playing_key = None
+
+            frame_times.append(max(time.time() - loop_start, 1e-6))
+            fps = len(frame_times) / sum(frame_times)
+
+            draw_keyboard(frame, key_rects, active_key, playing_key if loop_start < flash_until else None)
+            draw_hud(frame, active_key, fps, hand_visible)
+
+            cv2.imshow("Hand Piano", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
