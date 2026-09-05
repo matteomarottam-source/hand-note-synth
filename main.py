@@ -1,14 +1,21 @@
 import argparse
+import os
 import threading
 import time
+import urllib.request
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import sounddevice as sd
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
 
 NOTE_FREQS = {
     "C": 261.63,
@@ -76,6 +83,18 @@ def note_from_gesture(extended):
     return GESTURE_TO_NOTE.get(frozenset(extended))
 
 
+def ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Scarico il modello hand_landmarker.task (solo la prima volta)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+
+def draw_landmarks(frame, landmarks):
+    h, w = frame.shape[:2]
+    for lm in landmarks:
+        cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 4, (0, 255, 0), -1)
+
+
 MAX_WIDTH = 640
 
 
@@ -137,20 +156,27 @@ def main():
     args = parse_args()
     source = int(args.camera) if args.camera.isdigit() else args.camera
 
+    ensure_model()
+
     cap = CameraStream(source)
     if not cap.isOpened():
         print(f"Impossibile aprire la camera '{source}'. Prova un altro indice con --camera.")
         return
     cap.start()
 
-    last_note = None
-
-    with mp_hands.Hands(
-        max_num_hands=1,
-        model_complexity=0,
-        min_detection_confidence=0.7,
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
         min_tracking_confidence=0.7,
-    ) as hands:
+        running_mode=vision.RunningMode.VIDEO,
+    )
+
+    last_note = None
+    start_time = time.time()
+    last_timestamp_ms = -1
+
+    with vision.HandLandmarker.create_from_options(options) as landmarker:
         while cap.isOpened():
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -164,14 +190,18 @@ def main():
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            timestamp_ms = max(int((time.time() - start_time) * 1000), last_timestamp_ms + 1)
+            last_timestamp_ms = timestamp_ms
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             current_note = None
 
-            if results.multi_hand_landmarks:
-                hand_landmarks = results.multi_hand_landmarks[0]
-                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                extended = extended_fingers(hand_landmarks.landmark)
+            if result.hand_landmarks:
+                landmarks = result.hand_landmarks[0]
+                draw_landmarks(frame, landmarks)
+                extended = extended_fingers(landmarks)
                 current_note = note_from_gesture(extended)
 
             if current_note is not None and current_note != last_note:
