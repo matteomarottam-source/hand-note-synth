@@ -1,4 +1,5 @@
 import argparse
+import threading
 import time
 
 import cv2
@@ -75,6 +76,53 @@ def note_from_gesture(extended):
     return GESTURE_TO_NOTE.get(frozenset(extended))
 
 
+MAX_WIDTH = 640
+
+
+class CameraStream:
+    """Reads frames in a background thread and always exposes the latest one.
+
+    A plain cv2.VideoCapture().read() call processes frames in the order the
+    stream delivers them, so if processing (MediaPipe) is slower than the
+    incoming framerate - very common with a phone streamed over WiFi - the
+    displayed frame falls further and further behind real time. Grabbing
+    continuously in the background and dropping stale frames keeps the lag
+    from accumulating.
+    """
+
+    def __init__(self, source):
+        self.cap = cv2.VideoCapture(source)
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ok = False
+        self.stopped = False
+        self.thread = threading.Thread(target=self._update, daemon=True)
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _update(self):
+        while not self.stopped:
+            ok, frame = self.cap.read()
+            with self.lock:
+                self.ok, self.frame = ok, frame
+
+    def read(self):
+        with self.lock:
+            if self.frame is None:
+                return self.ok, None
+            return self.ok, self.frame.copy()
+
+    def release(self):
+        self.stopped = True
+        self.thread.join(timeout=1)
+        self.cap.release()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Hand gesture note synth")
     parser.add_argument(
@@ -89,22 +137,30 @@ def main():
     args = parse_args()
     source = int(args.camera) if args.camera.isdigit() else args.camera
 
-    cap = cv2.VideoCapture(source)
+    cap = CameraStream(source)
     if not cap.isOpened():
         print(f"Impossibile aprire la camera '{source}'. Prova un altro indice con --camera.")
         return
+    cap.start()
 
     last_note = None
 
     with mp_hands.Hands(
         max_num_hands=1,
+        model_complexity=0,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.7,
     ) as hands:
         while cap.isOpened():
             ok, frame = cap.read()
-            if not ok:
-                break
+            if not ok or frame is None:
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
+            if frame.shape[1] > MAX_WIDTH:
+                scale = MAX_WIDTH / frame.shape[1]
+                frame = cv2.resize(frame, None, fx=scale, fy=scale)
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
