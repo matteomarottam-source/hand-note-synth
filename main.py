@@ -19,44 +19,44 @@ MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 
-# (international name, italian name, frequency in Hz)
-NOTES = [
-    ("C", "Do", 261.63),
-    ("D", "Re", 293.66),
-    ("E", "Mi", 329.63),
-    ("F", "Fa", 349.23),
-    ("G", "Sol", 392.00),
-    ("A", "La", 440.00),
-    ("B", "Si", 493.88),
+SAMPLE_RATE = 44100
+NOTE_DURATION = 2.6
+MAX_VOICES = 24
+BLOCK_SIZE = 512
+
+STRING_COUNT = 15
+BASE_MIDI = 48  # C3, a warm harp register
+
+# a pentatonic scale has no dissonant pair, so any strum across the strings
+# sounds musical - the diatonic scale is one keypress away for full melodies
+SCALES = [
+    ("Pentatonica", [0, 2, 4, 7, 9]),
+    ("Completa", [0, 2, 4, 5, 7, 9, 11]),
 ]
 
-SAMPLE_RATE = 44100
-NOTE_DURATION = 1.6
-
-# relative amplitude of each harmonic; the fast roll-off plus the percussive
-# envelope in build_note_waves is what makes an additive tone read as "piano"
-PIANO_HARMONICS = [(1, 1.00), (2, 0.55), (3, 0.32), (4, 0.18), (5, 0.10), (6, 0.06), (7, 0.03)]
+SEMITONE_NAMES = {0: "Do", 2: "Re", 4: "Mi", 5: "Fa", 7: "Sol", 9: "La", 11: "Si"}
 
 # the hand is detected on a small copy of the frame while the HUD is drawn at
 # display size: landmarks are normalized, so the smaller image costs less CPU
 # without moving anything on screen
-DISPLAY_WIDTH = 800
+DISPLAY_WIDTH = 860
 DETECT_WIDTH = 384
 
-# pinch distance relative to hand size, with hysteresis so a hand held near the
-# threshold does not retrigger the note over and over
-PINCH_ON = 0.35
-PINCH_OFF = 0.50
+FINGERTIPS = [4, 8, 12, 16, 20]
+PLUCK_COOLDOWN = 0.12
 
-CURSOR_SMOOTHING = 0.45
-FLASH_SECONDS = 0.28
+STRING_DECAY = 0.86
+STRING_SPEED = 34.0
+RIPPLE_LIFE = 0.45
+LABEL_LIFE = 0.85
 
-COLOR_PANEL = (24, 20, 17)
-COLOR_KEY = (46, 40, 35)
-COLOR_TEXT = (244, 240, 236)
-COLOR_MUTED = (168, 160, 152)
-COLOR_ACCENT = (66, 170, 255)
-COLOR_CURSOR = (255, 206, 120)
+COLOR_DIM = (18, 14, 12)
+COLOR_PANEL = (26, 21, 18)
+COLOR_TEXT = (246, 242, 238)
+COLOR_MUTED = (162, 154, 146)
+COLOR_STRING = (150, 138, 128)
+COLOR_ACCENT = (86, 176, 255)
+COLOR_GLOW = (255, 208, 128)
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -68,23 +68,25 @@ HAND_CONNECTIONS = [
 ]
 
 FONT_CANDIDATES = [
-    "C:/Windows/Fonts/segoeuib.ttf",
-    "C:/Windows/Fonts/calibrib.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
+    ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeui.ttf"),
+    ("C:/Windows/Fonts/calibrib.ttf", "C:/Windows/Fonts/calibri.ttf"),
+    ("C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf"),
 ]
 
 
-def load_font(size):
-    for path in FONT_CANDIDATES:
+def load_font(size, bold=True):
+    for bold_path, regular_path in FONT_CANDIDATES:
+        path = bold_path if bold else regular_path
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
 FONTS = {
-    "hero": load_font(52),
-    "label": load_font(24),
-    "small": load_font(15),
+    "title": load_font(26),
+    "note": load_font(30),
+    "label": load_font(16),
+    "small": load_font(14, bold=False),
 }
 
 _sprite_cache = {}
@@ -93,9 +95,9 @@ _sprite_cache = {}
 def text_sprite(text, font_key, color):
     """Renders text once through PIL and caches it as a BGR + alpha pair.
 
-    Converting the whole frame to PIL and back every frame was the most
-    expensive part of the old HUD; small cached sprites blit with plain numpy
-    instead, which keeps the text crisp without the per-frame conversion.
+    Converting the whole frame to PIL and back on every frame was the most
+    expensive part of the earlier HUD; small cached sprites blit with plain
+    numpy instead, which keeps the text crisp without the conversion.
     """
     key = (text, font_key, color)
     sprite = _sprite_cache.get(key)
@@ -110,15 +112,12 @@ def text_sprite(text, font_key, color):
     ImageDraw.Draw(image).text((2 - left, 2 - top), text, font=font, fill=color[::-1] + (255,))
 
     rgba = np.array(image)
-    bgr = rgba[:, :, 2::-1].astype(np.float32)
-    alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
-
-    sprite = (bgr, alpha)
+    sprite = (rgba[:, :, 2::-1].astype(np.float32), rgba[:, :, 3:4].astype(np.float32) / 255.0)
     _sprite_cache[key] = sprite
     return sprite
 
 
-def blit(frame, sprite, x, y, center=False):
+def blit(frame, sprite, x, y, center=False, opacity=1.0):
     bgr, alpha = sprite
     h, w = alpha.shape[:2]
     if center:
@@ -132,6 +131,9 @@ def blit(frame, sprite, x, y, center=False):
 
     src_bgr = bgr[y1 - y:y2 - y, x1 - x:x2 - x]
     src_alpha = alpha[y1 - y:y2 - y, x1 - x:x2 - x]
+    if opacity < 1.0:
+        src_alpha = src_alpha * opacity
+
     roi = frame[y1:y2, x1:x2]
     roi[:] = (roi * (1 - src_alpha) + src_bgr * src_alpha).astype(np.uint8)
 
@@ -146,116 +148,134 @@ def fill_panel(frame, x1, y1, x2, y2, color, opacity):
     cv2.addWeighted(np.full_like(roi, color), opacity, roi, 1 - opacity, 0, dst=roi)
 
 
-def build_note_waves():
-    """Synthesizes every note once at startup instead of on each trigger."""
+def mix_color(color_a, color_b, t):
+    return tuple(int(a + (b - a) * t) for a, b in zip(color_a, color_b))
+
+
+def note_name(midi):
+    semitone = midi % 12
+    return f"{SEMITONE_NAMES.get(semitone, '?')}{midi // 12 - 1}"
+
+
+def scale_midi_notes(offsets):
+    notes = []
+    for i in range(STRING_COUNT):
+        octave, step = divmod(i, len(offsets))
+        notes.append(BASE_MIDI + 12 * octave + offsets[step])
+    return notes
+
+
+def build_waves(midi_notes):
+    """Synthesizes every string once at startup instead of on each pluck."""
     t = np.linspace(0, NOTE_DURATION, int(SAMPLE_RATE * NOTE_DURATION), endpoint=False)
-    envelope = np.exp(-3.0 * t)
-    attack = int(SAMPLE_RATE * 0.006)
-    envelope[:attack] *= np.linspace(0, 1, attack)
+    attack = int(SAMPLE_RATE * 0.004)
+    attack_ramp = np.linspace(0, 1, attack)
 
     waves = []
-    for _, _, freq in NOTES:
+    for midi in midi_notes:
+        freq = 440.0 * 2 ** ((midi - 69) / 12)
         wave = np.zeros_like(t)
-        for harmonic, amplitude in PIANO_HARMONICS:
-            wave += amplitude * np.sin(2 * np.pi * freq * harmonic * t)
-        wave *= envelope
-        wave *= 0.35 / np.max(np.abs(wave))
+
+        for harmonic in range(1, 8):
+            # higher harmonics fade faster than the fundamental, which is what
+            # separates a plucked string from a flat synth tone
+            decay = (1.4 + 2.0 * freq / 440.0) * harmonic ** 0.7
+            amplitude = 1.0 / harmonic ** 1.6
+            # slight inharmonicity, as in a real stretched string
+            partial = freq * harmonic * (1 + 0.0004 * harmonic ** 2)
+            wave += amplitude * np.sin(2 * np.pi * partial * t) * np.exp(-decay * t)
+
+        wave[:attack] *= attack_ramp
+        wave *= 0.5 / np.max(np.abs(wave))
         waves.append(wave.astype(np.float32))
 
     return waves
 
 
-def ensure_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Scarico il modello hand_landmarker.task (solo la prima volta)...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+class Synth:
+    """Polyphonic mixer so plucked strings keep ringing over each other."""
+
+    def __init__(self):
+        self.voices = []
+        self.lock = threading.Lock()
+        self.stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            blocksize=BLOCK_SIZE,
+            callback=self._callback,
+        )
+        self.stream.start()
+
+    def pluck(self, wave, gain):
+        with self.lock:
+            if len(self.voices) >= MAX_VOICES:
+                self.voices.pop(0)
+            self.voices.append([wave, 0, gain])
+
+    def _callback(self, outdata, frames, time_info, status):
+        buffer = np.zeros(frames, dtype=np.float32)
+
+        with self.lock:
+            for voice in self.voices:
+                wave, position, gain = voice
+                chunk = wave[position:position + frames]
+                if chunk.size:
+                    buffer[:chunk.size] += chunk * gain
+                voice[1] = position + frames
+            self.voices = [v for v in self.voices if v[1] < v[0].size]
+
+        np.clip(buffer, -1.0, 1.0, out=buffer)
+        outdata[:, 0] = buffer
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
 
 
-def keyboard_layout(width, height):
-    margin = int(width * 0.05)
-    key_height = int(height * 0.17)
-    top = height - key_height - int(height * 0.06)
-    key_width = (width - 2 * margin) / len(NOTES)
+class Harp:
+    """String geometry, vibration state and pluck detection."""
 
-    rects = []
-    for i in range(len(NOTES)):
-        x1 = int(margin + i * key_width) + 4
-        x2 = int(margin + (i + 1) * key_width) - 4
-        rects.append((x1, top, x2, top + key_height))
+    def __init__(self, width, height):
+        margin = int(width * 0.075)
+        self.xs = np.linspace(margin, width - margin, STRING_COUNT)
+        self.top = int(height * 0.20)
+        self.bottom = int(height * 0.86)
 
-    return rects, margin, key_width
+        self.amplitude = np.zeros(STRING_COUNT)
+        self.phase = np.zeros(STRING_COUNT)
 
+        # a standing wave: no displacement at the ends, maximum in the middle
+        steps = np.linspace(0, 1, 22)
+        self.ys = (self.top + steps * (self.bottom - self.top)).astype(np.int32)
+        self.profile = np.sin(np.pi * steps)
 
-def key_at(cursor_x, width, margin, key_width):
-    index = int((cursor_x * width - margin) / key_width)
-    return max(0, min(index, len(NOTES) - 1))
+    def update(self, dt):
+        self.amplitude *= STRING_DECAY ** (dt * 60)
+        self.phase += STRING_SPEED * dt
+        self.amplitude[self.amplitude < 0.4] = 0.0
 
+    def excite(self, index, strength):
+        self.amplitude[index] = 9.0 + 16.0 * strength
+        self.phase[index] = 0.0
 
-def draw_hand(frame, landmarks):
-    h, w = frame.shape[:2]
-    points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    def crossings(self, previous, current):
+        """Strings whose x lies between the fingertip's last and current position."""
+        if not (self.top <= current[1] <= self.bottom):
+            return []
 
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, points[a], points[b], COLOR_PANEL, 4, cv2.LINE_AA)
-        cv2.line(frame, points[a], points[b], COLOR_MUTED, 1, cv2.LINE_AA)
+        low, high = sorted((previous[0], current[0]))
+        return [i for i, x in enumerate(self.xs) if low <= x <= high]
 
-    for point in points:
-        cv2.circle(frame, point, 3, COLOR_TEXT, -1, cv2.LINE_AA)
-
-
-def draw_cursor(frame, position, pinching, keyboard_top):
-    x, y = position
-    cv2.line(frame, (x, y), (x, keyboard_top), COLOR_CURSOR, 1, cv2.LINE_AA)
-
-    if pinching:
-        cv2.circle(frame, (x, y), 16, COLOR_ACCENT, -1, cv2.LINE_AA)
-        cv2.circle(frame, (x, y), 24, COLOR_ACCENT, 2, cv2.LINE_AA)
-    else:
-        cv2.circle(frame, (x, y), 12, COLOR_CURSOR, 2, cv2.LINE_AA)
-        cv2.circle(frame, (x, y), 3, COLOR_CURSOR, -1, cv2.LINE_AA)
-
-
-def draw_keyboard(frame, rects, active_key, flashing_key):
-    for i, (x1, y1, x2, y2) in enumerate(rects):
-        international, italian, _ = NOTES[i]
-
-        if i == flashing_key:
-            fill_panel(frame, x1, y1, x2, y2, COLOR_ACCENT, 0.85)
-            label_color, sub_color = COLOR_PANEL, COLOR_PANEL
-        elif i == active_key:
-            fill_panel(frame, x1, y1, x2, y2, COLOR_KEY, 0.85)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_ACCENT, 2, cv2.LINE_AA)
-            label_color, sub_color = COLOR_TEXT, COLOR_ACCENT
-        else:
-            fill_panel(frame, x1, y1, x2, y2, COLOR_PANEL, 0.72)
-            label_color, sub_color = COLOR_TEXT, COLOR_MUTED
-
-        center_x = (x1 + x2) // 2
-        blit(frame, text_sprite(italian, "label", label_color), center_x, y1 + 30, center=True)
-        blit(frame, text_sprite(international, "small", sub_color), center_x, y2 - 22, center=True)
-
-
-def draw_hud(frame, note_index, fps, hand_visible):
-    width = frame.shape[1]
-
-    fill_panel(frame, 24, 24, 300, 116, COLOR_PANEL, 0.78)
-    if note_index is None:
-        blit(frame, text_sprite("—", "hero", COLOR_MUTED), 44, 36)
-        blit(frame, text_sprite("nessuna nota", "small", COLOR_MUTED), 46, 96)
-    else:
-        international, italian, freq = NOTES[note_index]
-        blit(frame, text_sprite(italian, "hero", COLOR_ACCENT), 44, 36)
-        blit(frame, text_sprite(f"{international} · {freq:.0f} Hz", "small", COLOR_MUTED), 46, 96)
-
-    status = "mano rilevata" if hand_visible else "mostra la mano alla camera"
-    status_color = COLOR_TEXT if hand_visible else COLOR_ACCENT
-    blit(frame, text_sprite(status, "small", status_color), 24, 130)
-
-    fps_sprite = text_sprite(f"{fps:.0f} FPS", "small", COLOR_MUTED)
-    blit(frame, fps_sprite, width - 24 - fps_sprite[1].shape[1], 28)
-
-    hint = "Muovi la mano per scegliere la nota  ·  pizzica pollice e indice per suonare  ·  Q per uscire"
-    blit(frame, text_sprite(hint, "small", COLOR_MUTED), frame.shape[1] // 2, frame.shape[0] - 22, center=True)
+    def draw(self, frame):
+        for i, x in enumerate(self.xs):
+            amplitude = self.amplitude[i]
+            if amplitude > 0:
+                offsets = amplitude * self.profile * np.sin(self.phase[i])
+                points = np.stack([(x + offsets).astype(np.int32), self.ys], axis=1)
+                glow = min(amplitude / 22.0, 1.0)
+                cv2.polylines(frame, [points], False, mix_color(COLOR_STRING, COLOR_GLOW, glow), 2, cv2.LINE_AA)
+            else:
+                cv2.line(frame, (int(x), self.top), (int(x), self.bottom), COLOR_STRING, 1, cv2.LINE_AA)
 
 
 class CameraStream:
@@ -268,16 +288,27 @@ class CameraStream:
     the background and dropping stale frames keeps the lag from accumulating.
     """
 
-    def __init__(self, source):
+    def __init__(self, source, capture_width):
         # DirectShow is more reliable than the default Media Foundation backend
         # for third-party virtual cameras on Windows (e.g. Iriun Webcam).
         if isinstance(source, int):
             self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
         else:
             self.cap = cv2.VideoCapture(source)
+
+        # asking the device for a smaller image is the one lever that reduces
+        # what a phone streams over WiFi, rather than paying for pixels we
+        # immediately scale away
+        if capture_width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, round(capture_width * 9 / 16))
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         self.lock = threading.Lock()
         self.frame = None
         self.ok = False
+        self.counter = 0
+        self.stamps = deque(maxlen=30)
         self.stopped = False
         self.thread = threading.Thread(target=self._update, daemon=True)
 
@@ -293,12 +324,21 @@ class CameraStream:
             ok, frame = self.cap.read()
             with self.lock:
                 self.ok, self.frame = ok, frame
+                self.counter += 1
+                self.stamps.append(time.time())
 
     def read(self):
         with self.lock:
             if self.frame is None:
-                return self.ok, None
-            return self.ok, self.frame.copy()
+                return self.ok, None, self.counter
+            return self.ok, self.frame.copy(), self.counter
+
+    def fps(self):
+        with self.lock:
+            stamps = list(self.stamps)
+        if len(stamps) < 2:
+            return 0.0
+        return (len(stamps) - 1) / max(stamps[-1] - stamps[0], 1e-6)
 
     def release(self):
         self.stopped = True
@@ -306,12 +346,90 @@ class CameraStream:
         self.cap.release()
 
 
+def ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Scarico il modello hand_landmarker.task (solo la prima volta)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+
+def draw_hand(frame, points):
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, points[a], points[b], COLOR_DIM, 4, cv2.LINE_AA)
+        cv2.line(frame, points[a], points[b], COLOR_MUTED, 1, cv2.LINE_AA)
+
+    for tip in FINGERTIPS:
+        cv2.circle(frame, points[tip], 9, COLOR_GLOW, 1, cv2.LINE_AA)
+        cv2.circle(frame, points[tip], 4, COLOR_GLOW, -1, cv2.LINE_AA)
+
+
+def draw_ripples(frame, ripples, now):
+    for ripple in ripples:
+        age = (now - ripple["born"]) / RIPPLE_LIFE
+        radius = int(12 + 46 * age * ripple["strength"])
+        cv2.circle(frame, ripple["pos"], radius, mix_color(COLOR_GLOW, COLOR_DIM, age), 2, cv2.LINE_AA)
+
+
+def draw_labels(frame, labels, now):
+    for label in labels:
+        age = (now - label["born"]) / LABEL_LIFE
+        x, y = label["pos"]
+        blit(frame, text_sprite(label["text"], "note", COLOR_GLOW), x, y - int(40 * age), center=True, opacity=1 - age)
+
+
+def draw_hud(frame, harp, names, scale_name, recent, fps, camera_fps, hand_visible, now):
+    width = frame.shape[1]
+
+    fill_panel(frame, 0, 0, width, 64, COLOR_PANEL, 0.72)
+    blit(frame, text_sprite("ARPA", "title", COLOR_ACCENT), 26, 16)
+    blit(frame, text_sprite("sfiora le corde con le dita", "small", COLOR_MUTED), 104, 26)
+
+    x = width - 26
+    # camera and render rates are shown apart: a low camera rate is the phone
+    # link, a low render rate is this machine
+    fps_color = COLOR_MUTED if camera_fps >= 15 else COLOR_ACCENT
+    fps_sprite = text_sprite(f"cam {camera_fps:.0f} · app {fps:.0f} FPS", "small", fps_color)
+    x -= fps_sprite[1].shape[1]
+    blit(frame, fps_sprite, x, 24)
+
+    scale_sprite = text_sprite(f"scala {scale_name.lower()}", "small", COLOR_MUTED)
+    x -= scale_sprite[1].shape[1] + 22
+    blit(frame, scale_sprite, x, 24)
+
+    for note, played_at in reversed(recent):
+        sprite = text_sprite(note, "label", COLOR_GLOW)
+        x -= sprite[1].shape[1] + 14
+        blit(frame, sprite, x, 22, opacity=max(0.15, 1 - (now - played_at) / 4.0))
+
+    for i, name in enumerate(names):
+        color = mix_color(COLOR_MUTED, COLOR_GLOW, min(harp.amplitude[i] / 22.0, 1.0))
+        blit(frame, text_sprite(name, "small", color), int(harp.xs[i]), harp.bottom + 20, center=True)
+
+    if not hand_visible:
+        message = text_sprite("mostra la mano alla camera", "label", COLOR_ACCENT)
+        blit(frame, message, width // 2, frame.shape[0] // 2, center=True)
+
+    hint = "muovi la mano tra le corde per suonare  ·  S cambia scala  ·  Q esci"
+    blit(frame, text_sprite(hint, "small", COLOR_MUTED), width // 2, frame.shape[0] - 20, center=True)
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Hand gesture piano")
+    parser = argparse.ArgumentParser(description="Hand tracked air harp")
     parser.add_argument(
         "--camera",
         default="0",
         help="Camera index (e.g. 0, 1) or stream URL (e.g. for an IP-camera app). Default: 0",
+    )
+    parser.add_argument(
+        "--capture-width",
+        type=int,
+        default=960,
+        help="Resolution requested from the camera; lower it for a laggy wireless camera. Default: 960",
+    )
+    parser.add_argument(
+        "--detect-width",
+        type=int,
+        default=DETECT_WIDTH,
+        help=f"Width the hand detector runs at; lower is faster. Default: {DETECT_WIDTH}",
     )
     return parser.parse_args()
 
@@ -321,9 +439,14 @@ def main():
     source = int(args.camera) if args.camera.isdigit() else args.camera
 
     ensure_model()
-    waves = build_note_waves()
 
-    cap = CameraStream(source)
+    scale_index = 0
+    scales = []
+    for name, offsets in SCALES:
+        midi_notes = scale_midi_notes(offsets)
+        scales.append((name, build_waves(midi_notes), [note_name(m) for m in midi_notes]))
+
+    cap = CameraStream(source, args.capture_width)
     if not cap.isOpened():
         print(f"Impossibile aprire la camera '{source}'. Prova un altro indice con --camera.")
         return
@@ -331,108 +454,145 @@ def main():
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
-        num_hands=1,
+        num_hands=2,
         min_hand_detection_confidence=0.6,
         min_hand_presence_confidence=0.6,
         min_tracking_confidence=0.6,
         running_mode=vision.RunningMode.VIDEO,
     )
 
-    cursor = None
-    pinching = False
-    playing_key = None
-    flash_until = 0.0
+    synth = Synth()
+    harp = None
+    previous_tips = {}
+    cooldowns = {}
+    ripples = []
+    labels = []
+    recent = deque(maxlen=5)
     frame_times = deque(maxlen=30)
     start_time = time.time()
     last_timestamp_ms = -1
-    layout_cache = None
+    last_frame_at = time.time()
+    last_detect_at = time.time()
+    last_counter = -1
+    hands = []
 
-    with vision.HandLandmarker.create_from_options(options) as landmarker:
-        while cap.isOpened():
-            loop_start = time.time()
+    try:
+        with vision.HandLandmarker.create_from_options(options) as landmarker:
+            while cap.isOpened():
+                now = time.time()
+                dt = min(now - last_frame_at, 0.1)
+                last_frame_at = now
 
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-                continue
+                ok, frame, counter = cap.read()
+                if not ok or frame is None:
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
 
-            if frame.shape[1] != DISPLAY_WIDTH:
-                scale = DISPLAY_WIDTH / frame.shape[1]
-                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            frame = cv2.flip(frame, 1)
+                # the render loop runs faster than a wireless camera delivers
+                # frames, so detection only reruns on genuinely new images
+                # while the animation keeps drawing at full rate
+                fresh = counter != last_counter
+                last_counter = counter
 
-            height, width = frame.shape[:2]
-            if layout_cache is None or layout_cache[0] != (width, height):
-                layout_cache = ((width, height), *keyboard_layout(width, height))
-            _, key_rects, margin, key_width = layout_cache
-            keyboard_top = key_rects[0][1]
+                if frame.shape[1] != DISPLAY_WIDTH:
+                    scale = DISPLAY_WIDTH / frame.shape[1]
+                    frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                frame = cv2.flip(frame, 1)
 
-            detect_scale = DETECT_WIDTH / width
-            small = cv2.resize(frame, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
-            )
+                height, width = frame.shape[:2]
+                if harp is None or harp.xs[-1] > width:
+                    harp = Harp(width, height)
 
-            timestamp_ms = max(int((time.time() - start_time) * 1000), last_timestamp_ms + 1)
-            last_timestamp_ms = timestamp_ms
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                if fresh:
+                    detect_scale = args.detect_width / width
+                    small = cv2.resize(frame, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
+                    mp_image = mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+                    )
 
-            active_key = None
-            hand_visible = bool(result.hand_landmarks)
+                    timestamp_ms = max(int((now - start_time) * 1000), last_timestamp_ms + 1)
+                    last_timestamp_ms = timestamp_ms
+                    hands = landmarker.detect_for_video(mp_image, timestamp_ms).hand_landmarks
 
-            if hand_visible:
-                landmarks = result.hand_landmarks[0]
-                draw_hand(frame, landmarks)
+                # the camera feed is a backdrop, so dim it to let the strings read
+                fill_panel(frame, 0, 0, width, height, COLOR_DIM, 0.45)
 
-                thumb, index = landmarks[4], landmarks[8]
-                target = ((thumb.x + index.x) / 2, (thumb.y + index.y) / 2)
-                cursor = target if cursor is None else (
-                    cursor[0] + (target[0] - cursor[0]) * CURSOR_SMOOTHING,
-                    cursor[1] + (target[1] - cursor[1]) * CURSOR_SMOOTHING,
-                )
+                scale_name, waves, names = scales[scale_index]
+                harp.update(dt)
 
-                hand_size = ((landmarks[0].x - landmarks[9].x) ** 2 + (landmarks[0].y - landmarks[9].y) ** 2) ** 0.5
-                pinch = (((thumb.x - index.x) ** 2 + (thumb.y - index.y) ** 2) ** 0.5) / max(hand_size, 1e-6)
+                hand_visible = bool(hands)
+                seen_tips = set()
 
-                active_key = key_at(cursor[0], width, margin, key_width)
+                detect_dt = max(now - last_detect_at, 1e-3)
+                for hand_index, landmarks in enumerate(hands):
+                    points = [(int(lm.x * width), int(lm.y * height)) for lm in landmarks]
+                    draw_hand(frame, points)
 
-                if not pinching and pinch < PINCH_ON:
-                    pinching = True
-                elif pinching and pinch > PINCH_OFF:
-                    pinching = False
-                    playing_key = None
+                    if not fresh:
+                        continue
 
-                # retriggering while pinched lets you slide across keys
-                if pinching and active_key != playing_key:
-                    sd.play(waves[active_key], SAMPLE_RATE)
-                    playing_key = active_key
-                    flash_until = loop_start + FLASH_SECONDS
+                    for tip in FINGERTIPS:
+                        key = (hand_index, tip)
+                        seen_tips.add(key)
+                        current = points[tip]
+                        previous = previous_tips.get(key)
+                        previous_tips[key] = current
+                        if previous is None:
+                            continue
 
-                draw_cursor(
+                        speed = abs(current[0] - previous[0]) / detect_dt
+                        strength = min(max(speed / 1400.0, 0.22), 1.0)
+
+                        for string_index in harp.crossings(previous, current):
+                            if now - cooldowns.get((key, string_index), 0) < PLUCK_COOLDOWN:
+                                continue
+                            cooldowns[(key, string_index)] = now
+
+                            synth.pluck(waves[string_index], strength)
+                            harp.excite(string_index, strength)
+                            ripples.append({"pos": current, "born": now, "strength": strength})
+                            labels.append({"pos": current, "born": now, "text": names[string_index]})
+                            recent.append((names[string_index], now))
+
+                if fresh:
+                    last_detect_at = now
+                    for key in list(previous_tips):
+                        if key not in seen_tips:
+                            del previous_tips[key]
+
+                harp.draw(frame)
+
+                ripples = [r for r in ripples if now - r["born"] < RIPPLE_LIFE]
+                labels = [l for l in labels if now - l["born"] < LABEL_LIFE]
+                draw_ripples(frame, ripples, now)
+                draw_labels(frame, labels, now)
+
+                frame_times.append(max(time.time() - now, 1e-6))
+                draw_hud(
                     frame,
-                    (int(cursor[0] * width), int(cursor[1] * height)),
-                    pinching,
-                    keyboard_top,
+                    harp,
+                    names,
+                    scale_name,
+                    list(recent),
+                    len(frame_times) / sum(frame_times),
+                    cap.fps(),
+                    hand_visible,
+                    now,
                 )
-            else:
-                cursor = None
-                pinching = False
-                playing_key = None
 
-            frame_times.append(max(time.time() - loop_start, 1e-6))
-            fps = len(frame_times) / sum(frame_times)
+                cv2.imshow("Air Harp", frame)
 
-            draw_keyboard(frame, key_rects, active_key, playing_key if loop_start < flash_until else None)
-            draw_hud(frame, active_key, fps, hand_visible)
-
-            cv2.imshow("Hand Piano", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
+                pressed = cv2.waitKey(1) & 0xFF
+                if pressed == ord("q"):
+                    break
+                if pressed == ord("s"):
+                    scale_index = (scale_index + 1) % len(scales)
+    finally:
+        synth.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
