@@ -110,7 +110,12 @@ class CameraStream:
     """
 
     def __init__(self, source):
-        self.cap = cv2.VideoCapture(source)
+        # DirectShow is more reliable than the default Media Foundation backend
+        # for third-party virtual cameras on Windows (e.g. Iriun Webcam).
+        if isinstance(source, int):
+            self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(source)
         self.lock = threading.Lock()
         self.frame = None
         self.ok = False
