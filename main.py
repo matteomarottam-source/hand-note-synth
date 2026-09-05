@@ -278,6 +278,58 @@ class Harp:
                 cv2.line(frame, (int(x), self.top), (int(x), self.bottom), COLOR_STRING, 1, cv2.LINE_AA)
 
 
+def open_capture(source):
+    # DirectShow is more reliable than the default Media Foundation backend
+    # for third-party virtual cameras on Windows (e.g. Iriun Webcam).
+    if isinstance(source, int):
+        return cv2.VideoCapture(source, cv2.CAP_DSHOW)
+    return cv2.VideoCapture(source)
+
+
+def preview_cameras(max_index=5):
+    """Shows one frame from every working camera, labelled with its index.
+
+    Device numbering shifts as cameras connect and disconnect, so which index
+    is the phone is only answerable by looking at the pictures.
+    """
+    tiles = []
+    for index in range(max_index):
+        cap = open_capture(index)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            print(f"camera {index}: si apre ma non manda immagini", flush=True)
+            continue
+
+        print(f"camera {index}: {frame.shape[1]}x{frame.shape[0]}", flush=True)
+        tile = cv2.resize(frame, (360, 270))
+        fill_panel(tile, 0, 0, 360, 40, COLOR_PANEL, 0.78)
+        blit(tile, text_sprite(f"--camera {index}", "label", COLOR_ACCENT), 12, 8)
+        tiles.append(tile)
+
+    if not tiles:
+        print("Nessuna camera disponibile. Controlla che Iriun sia connesso.")
+        return
+
+    strip = np.hstack(tiles)
+    fill_panel(strip, 0, strip.shape[0] - 36, strip.shape[1], strip.shape[0], COLOR_PANEL, 0.78)
+    blit(
+        strip,
+        text_sprite("riconosci la tua camera e riavvia con quell'indice · un tasto per chiudere", "small", COLOR_TEXT),
+        strip.shape[1] // 2,
+        strip.shape[0] - 26,
+        center=True,
+    )
+
+    cv2.imshow("Camere disponibili", strip)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
 class CameraStream:
     """Reads frames in a background thread and always exposes the latest one.
 
@@ -289,12 +341,7 @@ class CameraStream:
     """
 
     def __init__(self, source, capture_width):
-        # DirectShow is more reliable than the default Media Foundation backend
-        # for third-party virtual cameras on Windows (e.g. Iriun Webcam).
-        if isinstance(source, int):
-            self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        else:
-            self.cap = cv2.VideoCapture(source)
+        self.cap = open_capture(source)
 
         # asking the device for a smaller image is the one lever that reduces
         # what a phone streams over WiFi, rather than paying for pixels we
@@ -302,6 +349,11 @@ class CameraStream:
         if capture_width:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, round(capture_width * 9 / 16))
+            # some virtual cameras stop delivering frames entirely when asked
+            # for a size they do not support, so verify and back out if so
+            if not self.cap.read()[0]:
+                self.cap.release()
+                self.cap = open_capture(source)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self.lock = threading.Lock()
@@ -420,6 +472,11 @@ def parse_args():
         help="Camera index (e.g. 0, 1) or stream URL (e.g. for an IP-camera app). Default: 0",
     )
     parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Show a frame from every camera found, labelled with the index to pass to --camera",
+    )
+    parser.add_argument(
         "--capture-width",
         type=int,
         default=960,
@@ -436,6 +493,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.list_cameras:
+        preview_cameras()
+        return
+
     source = int(args.camera) if args.camera.isdigit() else args.camera
 
     ensure_model()
